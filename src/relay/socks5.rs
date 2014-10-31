@@ -58,20 +58,6 @@ pub enum CommandType {
     UdpAssociate,
 }
 
-pub struct Error {
-    pub code: u8,
-    pub message: String,
-}
-
-impl Error {
-    pub fn new(code: u8, message: &str) -> Error {
-        Error {
-            code: code,
-            message: message.to_string(),
-        }
-    }
-}
-
 pub struct DomainNameAddr {
     pub domain_name: String,
     pub port: Port,
@@ -97,13 +83,13 @@ impl Show for AddressType {
     }
 }
 
-pub fn parse_request_header(buf: &[u8]) -> Result<(uint, AddressType), Error> {
+pub fn parse_request_header(buf: &[u8]) -> Result<(uint, AddressType), u8> {
     let atyp = buf[0];
     match atyp {
         SOCKS5_ADDR_TYPE_IPV4 => {
             if buf.len() < 7 {
                 error!("Invalid IPv4 header");
-                return Err(Error::new(SOCKS5_REPLY_GENERAL_FAILURE, "Invalid IPv4 header"));
+                return Err(SOCKS5_REPLY_GENERAL_FAILURE);
             }
 
             let raw_addr = buf.slice(1, 5);
@@ -117,7 +103,7 @@ pub fn parse_request_header(buf: &[u8]) -> Result<(uint, AddressType), Error> {
         SOCKS5_ADDR_TYPE_IPV6 => {
             if buf.len() < 19 {
                 error!("Invalid IPv6 header");
-                return Err(Error::new(SOCKS5_REPLY_GENERAL_FAILURE, "Invalid IPv6 header"));
+                return Err(SOCKS5_REPLY_GENERAL_FAILURE);
             }
 
             let raw_addr = buf.slice(1, 17);
@@ -140,7 +126,7 @@ pub fn parse_request_header(buf: &[u8]) -> Result<(uint, AddressType), Error> {
             let addr_len = buf[1] as uint;
             if buf.len() < 4 + addr_len {
                 error!("Invalid domain name header");
-                return Err(Error::new(SOCKS5_REPLY_GENERAL_FAILURE, "Invalid domain name header"));
+                return Err(SOCKS5_REPLY_GENERAL_FAILURE);
             }
             let raw_addr = buf.slice(2, 2 + addr_len);
             let raw_port = buf.slice(2 + addr_len, 4 + addr_len);
@@ -153,7 +139,7 @@ pub fn parse_request_header(buf: &[u8]) -> Result<(uint, AddressType), Error> {
         },
         _ => {
             // Address type not supported
-            Err(Error::new(SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED, "Not supported address type"))
+            Err(SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED)
         }
     }
 }

@@ -19,20 +19,22 @@
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+use std::sync::{Arc, Mutex};
+
 use relay::loadbalancing::server::LoadBalancer;
-use config::{MultipleServer, SingleServer, ServerConfig, ServerConfigVariant};
+use config::{Config, MultipleServer, SingleServer, ServerConfig, ServerConfigVariant};
 
 #[deriving(Clone)]
 pub struct RoundRobin {
     server: ServerConfigVariant,
-    index: uint,
+    index: Arc<Mutex<uint>>,
 }
 
 impl RoundRobin {
-    pub fn new(config: ServerConfigVariant) -> RoundRobin {
+    pub fn new(config: Config) -> RoundRobin {
         RoundRobin {
-            server: config,
-            index: 0u,
+            server: config.server.expect("server should not be None"),
+            index: Arc::new(Mutex::new(0u)),
         }
     }
 }
@@ -42,8 +44,10 @@ impl LoadBalancer for RoundRobin {
         match self.server {
             SingleServer(ref s) => s,
             MultipleServer(ref slist) => {
-                let ref s = slist[self.index];
-                self.index = (self.index + 1) % slist.len();
+                let mtx = self.index.deref();
+                let mut idx = mtx.lock();
+                let ref s = slist[*idx];
+                *idx = (*idx + 1) % slist.len();
                 s
             }
         }

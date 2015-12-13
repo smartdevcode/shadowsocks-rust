@@ -23,20 +23,18 @@
 #![crate_name = "shadowsocks"]
 
 #![feature(box_syntax, libc, test, slice_patterns, lookup_host, convert)]
-#![feature(ip_addr)]
 
 extern crate rustc_serialize as serialize;
 #[macro_use]
 extern crate log;
 extern crate lru_cache;
 
-extern crate libsodium_sys as libsodium_ffi;
-
 extern crate byteorder;
 extern crate rand;
 
 extern crate coio;
 
+extern crate crypto as rust_crypto;
 extern crate ip;
 
 pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");

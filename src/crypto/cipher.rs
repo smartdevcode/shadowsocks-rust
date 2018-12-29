@@ -78,7 +78,9 @@ const CIPHER_AES_256_CFB_1: &str = "aes-256-cfb1";
 const CIPHER_AES_256_CFB_8: &str = "aes-256-cfb8";
 const CIPHER_AES_256_CFB_128: &str = "aes-256-cfb128";
 
+#[cfg(feature = "rc4")]
 const CIPHER_RC4: &str = "rc4";
+#[cfg(feature = "rc4")]
 const CIPHER_RC4_MD5: &str = "rc4-md5";
 
 const CIPHER_TABLE: &str = "table";
@@ -102,6 +104,7 @@ const CIPHER_PLAIN: &str = "plain";
 const CIPHER_AES_128_GCM: &str = "aes-128-gcm";
 const CIPHER_AES_256_GCM: &str = "aes-256-gcm";
 const CIPHER_CHACHA20_IETF_POLY1305: &str = "chacha20-ietf-poly1305";
+#[cfg(feature = "sodium")]
 const CIPHER_XCHACHA20_IETF_POLY1305: &str = "xchacha20-ietf-poly1305";
 
 /// ShadowSocks cipher type
@@ -120,7 +123,9 @@ pub enum CipherType {
     Aes256Cfb8,
     Aes256Cfb128,
 
+    #[cfg(feature = "rc4")]
     Rc4,
+    #[cfg(feature = "rc4")]
     Rc4Md5,
 
     #[cfg(feature = "sodium")]
@@ -156,8 +161,8 @@ pub enum CipherCategory {
 
 impl CipherType {
     /// Symmetric crypto key size
-    pub fn key_size(&self) -> usize {
-        match *self {
+    pub fn key_size(self) -> usize {
+        match self {
             CipherType::Table | CipherType::Plain => 0,
 
             CipherType::Aes128Cfb1 => symm::Cipher::aes_128_cfb1().key_len(),
@@ -167,6 +172,7 @@ impl CipherType {
             CipherType::Aes256Cfb8 => symm::Cipher::aes_256_cfb8().key_len(),
             CipherType::Aes256Cfb | CipherType::Aes256Cfb128 => symm::Cipher::aes_256_cfb128().key_len(),
 
+            #[cfg(feature = "rc4")]
             CipherType::Rc4 | CipherType::Rc4Md5 => symm::Cipher::rc4().key_len(),
 
             #[cfg(feature = "sodium")]
@@ -187,7 +193,7 @@ impl CipherType {
         }
     }
 
-    fn classic_bytes_to_key(&self, key: &[u8]) -> Bytes {
+    fn classic_bytes_to_key(self, key: &[u8]) -> Bytes {
         let iv_len = self.iv_size();
         let key_len = self.key_size();
 
@@ -219,13 +225,13 @@ impl CipherType {
     }
 
     /// Extends key to match the required key length
-    pub fn bytes_to_key(&self, key: &[u8]) -> Bytes {
+    pub fn bytes_to_key(self, key: &[u8]) -> Bytes {
         self.classic_bytes_to_key(key)
     }
 
     /// Symmetric crypto initialize vector size
-    pub fn iv_size(&self) -> usize {
-        match *self {
+    pub fn iv_size(self) -> usize {
+        match self {
             CipherType::Table | CipherType::Plain => 0,
 
             CipherType::Aes128Cfb1 => symm::Cipher::aes_128_cfb1()
@@ -247,7 +253,9 @@ impl CipherType {
                 .iv_len()
                 .expect("iv_len should not be None"),
 
+            #[cfg(feature = "rc4")]
             CipherType::Rc4 => symm::Cipher::rc4().iv_len().expect("iv_len should not be None"),
+            #[cfg(feature = "rc4")]
             CipherType::Rc4Md5 => 16,
 
             #[cfg(feature = "sodium")]
@@ -282,14 +290,14 @@ impl CipherType {
     }
 
     /// Generate a random initialize vector for this cipher
-    pub fn gen_init_vec(&self) -> Bytes {
+    pub fn gen_init_vec(self) -> Bytes {
         let iv_len = self.iv_size();
         CipherType::gen_random_bytes(iv_len)
     }
 
     /// Get category of cipher
-    pub fn category(&self) -> CipherCategory {
-        match *self {
+    pub fn category(self) -> CipherCategory {
+        match self {
             CipherType::Aes128Gcm | CipherType::Aes256Gcm | CipherType::ChaCha20IetfPoly1305 => CipherCategory::Aead,
 
             #[cfg(feature = "sodium")]
@@ -303,10 +311,10 @@ impl CipherType {
     }
 
     /// Get tag size for AEAD Ciphers
-    pub fn tag_size(&self) -> usize {
+    pub fn tag_size(self) -> usize {
         assert!(self.category() == CipherCategory::Aead);
 
-        match *self {
+        match self {
             CipherType::Aes128Gcm => AES_128_GCM.tag_len(),
             CipherType::Aes256Gcm => AES_256_GCM.tag_len(),
             CipherType::ChaCha20IetfPoly1305 => CHACHA20_POLY1305.tag_len(),
@@ -321,13 +329,13 @@ impl CipherType {
     }
 
     /// Get nonce size for AEAD ciphers
-    pub fn salt_size(&self) -> usize {
+    pub fn salt_size(self) -> usize {
         assert!(self.category() == CipherCategory::Aead);
         self.key_size()
     }
 
     /// Get salt for AEAD ciphers
-    pub fn gen_salt(&self) -> Bytes {
+    pub fn gen_salt(self) -> Bytes {
         CipherType::gen_random_bytes(self.salt_size())
     }
 }
@@ -349,7 +357,9 @@ impl FromStr for CipherType {
             CIPHER_AES_256_CFB_8 => Ok(CipherType::Aes256Cfb8),
             CIPHER_AES_256_CFB_128 => Ok(CipherType::Aes256Cfb128),
 
+            #[cfg(feature = "rc4")]
             CIPHER_RC4 => Ok(CipherType::Rc4),
+            #[cfg(feature = "rc4")]
             CIPHER_RC4_MD5 => Ok(CipherType::Rc4Md5),
 
             #[cfg(feature = "sodium")]
@@ -393,7 +403,9 @@ impl Display for CipherType {
             CipherType::Aes256Cfb8 => write!(f, "{}", CIPHER_AES_256_CFB_8),
             CipherType::Aes256Cfb128 => write!(f, "{}", CIPHER_AES_256_CFB_128),
 
+            #[cfg(feature = "rc4")]
             CipherType::Rc4 => write!(f, "{}", CIPHER_RC4),
+            #[cfg(feature = "rc4")]
             CipherType::Rc4Md5 => write!(f, "{}", CIPHER_RC4_MD5),
 
             #[cfg(feature = "sodium")]
@@ -439,6 +451,7 @@ mod test_cipher {
         assert!(message.as_bytes() == &decrypted_msg[..]);
     }
 
+    #[cfg(feature = "rc4")]
     #[test]
     fn test_rc4_md5_key_iv() {
         let ty = CipherType::Rc4Md5;

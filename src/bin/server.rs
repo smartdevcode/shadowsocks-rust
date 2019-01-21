@@ -273,7 +273,5 @@ fn main() {
 
     runtime.shutdown_now().wait().unwrap();
 
-    if let Err(err) = result {
-        panic!("Server exited unexpectly with error: {:?}", err);
-    }
+    panic!("Server exited unexpectly with result: {:?}", result);
 }

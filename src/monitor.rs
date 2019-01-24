@@ -8,11 +8,10 @@ use tokio_io::IoFuture;
 
 use futures::{self, stream::futures_unordered, Future, Stream};
 
-use crate::plugin::Plugin;
-use crate::relay::boxed_future;
+use crate::{plugin::Plugin, relay::boxed_future};
 
 #[cfg(unix)]
-pub fn monitor_signal(plugins: Vec<Plugin>) -> impl Future<Item = (), Error = io::Error> + Send {
+pub fn monitor_signal() -> impl Future<Item = (), Error = io::Error> + Send {
     use tokio_signal::unix::Signal;
 
     // Monitor SIGCHLD, triggered if subprocess (plugin) is exited.
@@ -66,22 +65,14 @@ pub fn monitor_signal(plugins: Vec<Plugin>) -> impl Future<Item = (), Error = io
     // Join them all, if any of them is triggered, kill all subprocesses and exit.
     futures_unordered(vec![boxed_future(fut1), boxed_future(fut2), boxed_future(fut3)])
         .into_future()
-        .then(move |r| {
-            // Something happened ... killing all subprocesses
-            info!("Killing {} plugin(s) and then ... Bye Bye :)", plugins.len());
-            drop(plugins);
-
-            match r {
-                Ok(..) => {
-                    process::exit(0);
-                }
-                Err((err, ..)) => Err(err),
-            }
+        .then(move |r| match r {
+            Ok(..) => Ok(()),
+            Err((err, ..)) => Err(err),
         })
 }
 
 #[cfg(windows)]
-pub fn monitor_signal(plugins: Vec<Plugin>) -> impl Future<Item = (), Error = io::Error> + Send {
+pub fn monitor_signal() -> impl Future<Item = (), Error = io::Error> + Send {
     // FIXME: How to handle SIGTERM equavalent in Windows?
 
     use tokio_signal::windows::Event;
@@ -117,25 +108,16 @@ pub fn monitor_signal(plugins: Vec<Plugin>) -> impl Future<Item = (), Error = io
         // Join them all, if any of them is triggered, kill all subprocesses and exit.
         futures_unordered(vec![boxed_future(fut1), boxed_future(fut2)])
             .into_future()
-            .then(|r| {
-                // Something happened ... killing all subprocesses
-                info!("Killing {} plugin(s) and then ... Bye Bye :)", plugins.len());
-                drop(plugins);
-                match r {
-                    Ok(..) => {
-                        process::exit(libc::EXIT_FAILURE);
-                    }
-                    Err((err, ..)) => Err(err),
-                }
+            .then(|r| match r {
+                Ok(..) => Ok(()),
+                Err((err, ..)) => Err(err),
             })
     })
 }
 
 #[cfg(not(any(windows, unix)))]
-pub fn monitor_signal(plugins: Vec<Plugin>) -> impl Future<Item = (), Error = io::Error> + Send {
+pub fn monitor_signal() -> impl Future<Item = (), Error = io::Error> + Send {
     // FIXME: What can I do ...
     // Blocks forever
-    futures::empty::<(), ()>().and_then(|_| {
-        drop(plugins);
-    })
+    futures::empty::<(), ()>()
 }

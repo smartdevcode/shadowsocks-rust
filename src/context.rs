@@ -291,6 +291,9 @@ impl Context {
     /// Add a record to the reverse lookup cache
     #[cfg(feature = "local-dns-relay")]
     pub fn add_to_reverse_lookup_cache(&self, addr: &IpAddr, forward: bool) {
+        if self.check_ip_in_proxy_list(addr) == forward {
+            return;
+        }
         let mut reverse_lookup_cache = self.reverse_lookup_cache.lock();
         reverse_lookup_cache.insert(addr.clone(), forward);
     }
@@ -315,8 +318,6 @@ impl Context {
                 let mut reverse_lookup_cache = self.reverse_lookup_cache.lock();
                 // if a qname is found
                 if let Some(forward) = reverse_lookup_cache.get(ip) {
-                    // if qname is resolved by remote,
-                    // we should proxy it as well
                     *forward
                 } else {
                     a.check_ip_in_proxy_list(ip)

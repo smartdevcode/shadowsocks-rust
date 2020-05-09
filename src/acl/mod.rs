@@ -13,6 +13,7 @@ use std::{
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
 use regex::{RegexSet, RegexSetBuilder};
+use trust_dns_proto::rr::Name;
 
 use crate::{context::Context, relay::socks5::Address};
 
@@ -83,6 +84,16 @@ impl Rules {
     /// Check if the specified host matches any rules
     fn check_host_matched(&self, host: &str) -> bool {
         self.rule.is_match(host)
+    }
+
+    /// Check if there are no rules for IPv4 addresses
+    fn is_ipv4_empty(&self) -> bool {
+        self.ipv4.iter().next().is_none()
+    }
+
+    /// Check if there are no rules for IPv6 addresses
+    fn is_ipv6_empty(&self) -> bool {
+        self.ipv6.iter().next().is_none()
     }
 }
 
@@ -269,21 +280,52 @@ impl AccessControl {
 
     /// Check if domain name is in proxy_list.
     /// If so, it should be resolved from remote (for Android's DNS relay)
-    pub fn check_qname_in_proxy_list(&self, addr: &Address) -> Option<bool> {
+    pub fn check_name_in_proxy_list(&self, name: &Name) -> Option<bool> {
+        if !name.is_fqdn() {
+            // unconditionally use default for PQDNs
+            return Some(self.is_default_in_proxy_list());
+        }
+        // remove the last dot from fqdn name
+        let mut name = name.to_ascii();
+        name.pop();
+        let addr = Address::DomainNameAddress(name, 0);
         // Addresses in proxy_list will be proxied
-        if self.white_list.check_address_matched(addr) {
+        if self.white_list.check_address_matched(&addr) {
             return Some(true);
         }
-        if self.black_list.check_address_matched(addr) {
+        if self.black_list.check_address_matched(&addr) {
             return Some(false);
         }
         None
+    }
+
+    /// If there are no IPv4 rules
+    pub fn is_ipv4_empty(&self) -> bool {
+        match self.mode {
+            Mode::BlackList => self.black_list.is_ipv4_empty(),
+            Mode::WhiteList => self.white_list.is_ipv4_empty(),
+        }
+    }
+
+    /// If there are no IPv4 rules
+    pub fn is_ipv6_empty(&self) -> bool {
+        match self.mode {
+            Mode::BlackList => self.black_list.is_ipv6_empty(),
+            Mode::WhiteList => self.white_list.is_ipv6_empty(),
+        }
     }
 
     pub fn check_ip_in_proxy_list(&self, ip: &IpAddr) -> bool {
         match self.mode {
             Mode::BlackList => !self.black_list.check_ip_matched(ip),
             Mode::WhiteList => self.white_list.check_ip_matched(ip),
+        }
+    }
+
+    pub fn is_default_in_proxy_list(&self) -> bool {
+        match self.mode {
+            Mode::BlackList => true,
+            Mode::WhiteList => false,
         }
     }
 
@@ -318,11 +360,7 @@ impl AccessControl {
             }
         }
 
-        // default rule
-        match self.mode {
-            Mode::BlackList => false,
-            Mode::WhiteList => true,
-        }
+        !self.is_default_in_proxy_list()
     }
 
     /// Check if client address should be blocked (for server)

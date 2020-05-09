@@ -1,194 +1,178 @@
 use std::{
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
 
-#[cfg(target_os = "android")]
-use std::path::PathBuf;
-#[cfg(target_os = "android")]
-use tokio::net::UnixStream;
-
-#[cfg(not(target_os = "android"))]
-use std::net::{Ipv4Addr, SocketAddrV4};
-#[cfg(not(target_os = "android"))]
-use tokio::net::UdpSocket;
-
-use byteorder::{BigEndian, ByteOrder};
-use log::{debug, error, info};
-use rand::Rng;
+use log::{debug, error, info, warn};
 use trust_dns_proto::{
     op::{header::MessageType, response_code::ResponseCode, Message, Query},
-    rr::{Name, RData, RecordType},
+    rr::{DNSClass, Name, RData, RecordType},
 };
 
 use crate::{
-    config::{ConfigType, ServerConfig},
+    acl::AccessControl,
+    config::ConfigType,
     context::SharedContext,
     relay::{
         loadbalancing::server::{PlainPingBalancer, ServerType},
-        socks5::Address,
         sys::create_udp_socket,
-        tcprelay::ProxyStream,
         utils::try_timeout,
     },
 };
 
-async fn stream_lookup<T>(qname: &Name, qtype: RecordType, stream: &mut T) -> io::Result<Message>
-where
-    T: AsyncReadExt + AsyncWriteExt + Unpin,
+mod upstream;
+
+fn should_forward_by_ptr_name(acl: &AccessControl, name: &Name) -> bool {
+    let mut iter = name.iter().rev();
+    let mut next = || std::str::from_utf8(iter.next().unwrap_or(&[48])).unwrap_or("*");
+    if !"arpa".eq_ignore_ascii_case(next()) {
+        return acl.is_default_in_proxy_list();
+    }
+    match &next().to_ascii_lowercase()[..] {
+        "in-addr" => {
+            let mut octets: [u8; 4] = [0; 4];
+            for octet in octets.iter_mut() {
+                match next().parse() {
+                    Ok(result) => *octet = result,
+                    Err(_) => return acl.is_default_in_proxy_list(),
+                }
+            }
+            acl.check_ip_in_proxy_list(&IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])))
+        }
+        "ip6" => {
+            let mut segments: [u16; 8] = [0; 8];
+            for segment in segments.iter_mut() {
+                match u16::from_str_radix(&[next(), next(), next(), next()].concat(), 16) {
+                    Ok(result) => *segment = result,
+                    Err(_) => return acl.is_default_in_proxy_list(),
+                }
+            }
+            acl.check_ip_in_proxy_list(&IpAddr::V6(Ipv6Addr::new(
+                segments[0], segments[1], segments[2], segments[3], segments[4], segments[5], segments[6], segments[7]
+            )))
+        }
+        _ => acl.is_default_in_proxy_list(),
+    }
+}
+
+/// given the query, determine whether remote/local query should be used, or inconclusive
+fn should_forward_by_query(acl: &Option<AccessControl>, query: &Query) -> Option<bool> {
+    if let Some(acl) = acl {
+        if query.query_class() != DNSClass::IN {
+            // unconditionally use default for all non-IN queries
+            Some(acl.is_default_in_proxy_list())
+        } else if query.query_type() == RecordType::PTR {
+            Some(should_forward_by_ptr_name(acl, query.name()))
+        } else {
+            let result = acl.check_name_in_proxy_list(query.name());
+            if result == None && match query.query_type() {
+                RecordType::A => acl.is_ipv4_empty(),
+                RecordType::AAAA => acl.is_ipv6_empty(),
+                RecordType::ANY => acl.is_ipv4_empty() && acl.is_ipv6_empty(),
+                RecordType::PTR => panic!("PTR records should not reach here"),
+                _ => true,
+            } {
+                Some(acl.is_default_in_proxy_list())
+            } else {
+                result
+            }
+        }
+    } else {
+        Some(true)
+    }
+}
+
+/// given the local response, determine whether remote response should be used instead
+fn should_forward_by_response(
+    acl: &Option<AccessControl>,
+    local_response: &io::Result<Message>,
+    query: &Query,
+) -> bool {
+    if let Some(acl) = acl {
+        macro_rules! examine_record {
+            ($rec:ident, $is_answer:expr) => {
+                if let RData::CNAME(ref name) = $rec.rdata() {
+                    match acl.check_name_in_proxy_list(name) {
+                        Some(value) => return value,
+                        None => continue,
+                    }
+                } else if $is_answer && !query.query_type().is_any() && $rec.record_type() != query.query_type() {
+                    warn!("local DNS response has inconsistent answer type {} for query {}", $rec.record_type(), query);
+                    return true;
+                }
+                let forward = match $rec.rdata() {
+                    RData::A(ref ip) => acl.check_ip_in_proxy_list(&IpAddr::from(*ip)),
+                    RData::AAAA(ref ip) => acl.check_ip_in_proxy_list(&IpAddr::from(*ip)),
+                    RData::PTR(_) => panic!("PTR records should not reach here"),
+                    _ => acl.is_default_in_proxy_list(),
+                };
+                if !forward {
+                    return false;
+                }
+            };
+        }
+        if let Ok(ref local_response) = local_response {
+            for rec in local_response.answers() {
+                examine_record!(rec, true);
+            }
+            for rec in local_response.additionals() {
+                examine_record!(rec, false);
+            }
+        }
+        true
+    } else {
+        panic!("should not reach here")
+    }
+}
+
+async fn acl_lookup<Local, Remote>(
+    acl: &Option<AccessControl>,
+    local: Arc<Local>,
+    remote: Arc<Remote>,
+    query: &Query
+) -> (io::Result<Message>, bool)
+    where
+        Local: upstream::Upstream,
+        Remote: upstream::Upstream,
 {
-    let mut message = Message::new();
-    let mut query = Query::new();
-
-    query.set_query_type(qtype);
-    query.set_name(qname.clone());
-
-    let id = rand::thread_rng().gen();
-    message.set_id(id);
-    message.set_recursion_desired(true);
-    message.add_query(query);
-
-    let req_buffer = message.to_vec()?;
-    let size = req_buffer.len();
-    let mut send_buffer = vec![0; size + 2];
-
-    BigEndian::write_u16(&mut send_buffer[0..2], size as u16);
-    send_buffer[2..size + 2].copy_from_slice(&req_buffer[0..size]);
-    stream.write_all(&send_buffer[0..size + 2]).await?;
-
-    let mut res_buffer = vec![0; 2];
-    stream.read_exact(&mut res_buffer[0..2]).await?;
-
-    let size = BigEndian::read_u16(&res_buffer[0..2]) as usize;
-    let mut res_buffer = vec![0; size];
-    stream.read_exact(&mut res_buffer[0..size]).await?;
-
-    Ok(Message::from_vec(&res_buffer)?)
-}
-
-#[cfg(target_os = "android")]
-async fn local_lookup(qname: &Name, qtype: RecordType, path: &PathBuf) -> io::Result<Message> {
-    let mut stream = UnixStream::connect(path).await?;
-    stream_lookup(qname, qtype, &mut stream).await
-}
-
-#[cfg(not(target_os = "android"))]
-async fn local_lookup(qname: &Name, qtype: RecordType, server: &SocketAddr) -> io::Result<Message> {
-    let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
-    let mut socket = UdpSocket::bind(bind_addr).await?;
-
-    let mut message = Message::new();
-    let mut query = Query::new();
-
-    query.set_query_type(qtype);
-    query.set_name(qname.clone());
-
-    let id = rand::thread_rng().gen();
-    message.set_id(id);
-    message.set_recursion_desired(true);
-    message.add_query(query);
-
-    let req_buffer = message.to_vec()?;
-    socket.send_to(&req_buffer, server).await?;
-
-    let mut res_buffer = vec![0; 512];
-    socket.recv_from(&mut res_buffer).await?;
-
-    Ok(Message::from_vec(&res_buffer)?)
-}
-
-async fn proxy_lookup(
-    context: SharedContext,
-    svr_cfg: &ServerConfig,
-    ns: &Address,
-    qname: &Name,
-    qtype: RecordType,
-) -> io::Result<Message> {
-    let mut stream = ProxyStream::connect_proxied(context, svr_cfg, ns).await?;
-    stream_lookup(qname, qtype, &mut stream).await
-}
-
-async fn acl_lookup(
-    context: SharedContext,
-    svr_cfg: &ServerConfig,
-    #[cfg(target_os = "android")] local: &PathBuf,
-    #[cfg(not(target_os = "android"))] local: &SocketAddr,
-    remote: &Address,
-    qname: &Name,
-    qtype: RecordType,
-) -> io::Result<(Message, bool)> {
     // Start querying name servers
     debug!(
         "attempting lookup of {:?} {} with ns {:?} and {:?}",
-        qtype, qname, local, remote
+        query.query_type(), query.name(), local, remote
     );
 
-    // remove the last dot from fqdn name
-    let mut name = qname.to_ascii();
-    name.pop();
-    let addr = Address::DomainNameAddress(name, 0);
-    let qname_in_proxy_list = context.check_qname_in_proxy_list(&addr);
+    let remote_response_fut = try_timeout(remote.lookup(query), Some(Duration::new(3, 0)));
+    let local_response_fut = try_timeout(local.lookup(query), Some(Duration::new(3, 0)));
 
-    let remote_response_fut = async {
-        match qname_in_proxy_list {
-            Some(false) => None,
-            _ => {
-                let timeout = Some(Duration::new(3, 0));
-                try_timeout(proxy_lookup(context.clone(), svr_cfg, remote, qname, qtype), timeout)
-                    .await
-                    .ok()
-            }
-        }
-    };
-
-    let local_response = match qname_in_proxy_list {
-        Some(true) => None,
-        _ => {
-            let timeout = Some(Duration::new(3, 0));
-            try_timeout(local_lookup(qname, qtype, local), timeout).await.ok()
-        }
-    }
-    .unwrap_or_else(Message::new);
-
-    match qname_in_proxy_list {
+    match should_forward_by_query(acl, query) {
         Some(true) => {
-            let remote_response = remote_response_fut.await.unwrap_or_else(Message::new);
-            debug!("pick remote response (qname): {:?}", remote_response);
-            return Ok((remote_response, true));
+            let remote_response = remote_response_fut.await;
+            debug!("pick remote response (query): {:?}", remote_response);
+            return (remote_response, true);
         }
         Some(false) => {
-            debug!("pick local response (qname): {:?}", local_response);
-            return Ok((local_response, false));
+            let local_response = local_response_fut.await;
+            debug!("pick local response (query): {:?}", local_response);
+            return (local_response, false);
         }
         None => (),
     }
 
-    if local_response.answer_count() == 0 {
-        let remote_response = remote_response_fut.await.unwrap_or_else(Message::new);
-        return Ok((remote_response, true));
-    }
+    // FIXME: spawn(remote_response_fut)
+    let local_response = local_response_fut.await;
 
-    for rec in local_response.answers() {
-        let forward = match rec.rdata() {
-            RData::A(ref ip) => context.check_ip_in_proxy_list(&IpAddr::from(*ip)),
-            RData::AAAA(ref ip) => context.check_ip_in_proxy_list(&IpAddr::from(*ip)),
-            _ => true,
-        };
-        if !forward {
-            debug!("pick local response (ip): {:?}", local_response);
-            return Ok((local_response, false));
-        }
+    if should_forward_by_response(acl, &local_response, query) {
+        let remote_response = remote_response_fut.await;
+        debug!("pick remote response (response): {:?}", remote_response);
+        (remote_response, true)
+    } else {
+        debug!("pick local response (response): {:?}", local_response);
+        (local_response, false)
     }
-
-    let remote_response = remote_response_fut.await.unwrap_or_else(Message::new);
-    debug!("pick remote response (ip): {:?}", remote_response);
-    Ok((remote_response, true))
 }
 
 /// Start a DNS relay local server
@@ -225,8 +209,22 @@ pub async fn run(context: SharedContext) -> io::Result<()> {
         }
     });
 
+    let config = context.config();
+    #[cfg(target_os = "android")]
+        let local_upstream = Arc::new(upstream::UnixSocketUpstream {
+        path: config.local_dns_path.clone().expect("local query DNS path"),
+    });
+    #[cfg(not(target_os = "android"))]
+        let local_upstream = Arc::new(upstream::UdpUpstream {
+        server: config.local_dns_addr.clone().expect("local query DNS address"),
+    });
     // FIXME: We use TCP to send remote queries by default, which should be configuable.
     let balancer = PlainPingBalancer::new(context.clone(), ServerType::Tcp).await;
+    let remote_upstream = Arc::new(upstream::ProxyTcpUpstream {
+        context: context.clone(),
+        svr_cfg: move || balancer.pick_server().server_config().clone(),
+        ns: config.remote_dns_addr.clone().expect("remote query DNS address"),
+    });
 
     loop {
         let mut req_buffer: [u8; 512] = [0; 512];
@@ -249,8 +247,9 @@ pub async fn run(context: SharedContext) -> io::Result<()> {
         debug!("received src: {}, query: {:?}", src, request);
 
         let context = context.clone();
+        let local_upstream = Arc::clone(&local_upstream);
+        let remote_upstream = Arc::clone(&remote_upstream);
         let mut qtx = qtx.clone();
-        let server = balancer.pick_server();
 
         tokio::spawn(async move {
             let mut message = Message::new();
@@ -262,24 +261,10 @@ pub async fn run(context: SharedContext) -> io::Result<()> {
             if request.queries().is_empty() {
                 message.set_response_code(ResponseCode::FormErr);
             } else {
-                let config = context.config();
-
-                #[cfg(target_os = "android")]
-                let local_addr = config.local_dns_path.as_ref().expect("local query DNS path");
-                #[cfg(not(target_os = "android"))]
-                let local_addr = config.local_dns_addr.as_ref().expect("local query DNS address");
-
-                let remote_addr = config.remote_dns_addr.as_ref().expect("remote query DNS address");
-
                 let question = &request.queries()[0];
+                let (r, forward) = acl_lookup(context.acl(), local_upstream, remote_upstream, question).await;
 
-                let qname = question.name();
-                let qtype = question.query_type();
-                let svr_cfg = server.server_config();
-
-                let r = acl_lookup(context.clone(), svr_cfg, &local_addr, &remote_addr, qname, qtype).await;
-
-                if let Ok((result, forward)) = r {
+                if let Ok(result) = r {
                     for rec in result.answers() {
                         debug!("dns answer: {:?}", rec);
 

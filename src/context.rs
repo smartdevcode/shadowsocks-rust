@@ -13,7 +13,6 @@ use std::{
 use std::{net::IpAddr, time::Duration};
 
 use bloomfilter::Bloom;
-use log::warn;
 #[cfg(feature = "local-dns-relay")]
 use lru_time_cache::LruCache;
 use spin::Mutex;
@@ -26,8 +25,8 @@ use crate::relay::dns_resolver::create_resolver;
 #[cfg(feature = "local-flow-stat")]
 use crate::relay::flow::ServerFlowStatistic;
 use crate::{
+    acl::AccessControl,
     config::{Config, ConfigType, ServerConfig},
-    crypto::CipherType,
     relay::{dns_resolver::resolve, socks5::Address},
 };
 
@@ -183,30 +182,6 @@ pub type SharedContext = Arc<Context>;
 impl Context {
     /// Create a non-shared Context
     fn new(config: Config, server_state: SharedServerState) -> Context {
-        for server in &config.server {
-            let t = server.method();
-
-            // Warning for deprecated ciphers
-            // The following stream ciphers have inherent weaknesses (see discussion at https://github.com/shadowsocks/shadowsocks-org/issues/36).
-            // DO NOT USE. Implementors are advised to remove them as soon as possible.
-            let deprecated = match t {
-                #[cfg(feature = "sodium")]
-                CipherType::ChaCha20 | CipherType::Salsa20 => true,
-                #[cfg(feature = "rc4")]
-                CipherType::Rc4Md5 => true,
-                _ => false,
-            };
-            if deprecated {
-                warn!(
-                    "stream cipher {} (for server {}) have inherent weaknesses \
-                       (see discussion at https://github.com/shadowsocks/shadowsocks-org/issues/36). \
-                       DO NOT USE. It will be removed in the future.",
-                    t,
-                    server.addr(),
-                );
-            }
-        }
-
         let nonce_ppbloom = Mutex::new(PingPongBloom::new(config.config_type));
         #[cfg(feature = "local-dns-relay")]
         let reverse_lookup_cache = Mutex::new(LruCache::<IpAddr, bool>::with_expiry_duration(Duration::from_secs(
@@ -294,7 +269,7 @@ impl Context {
 
     /// Check client ACL (for server)
     pub fn check_client_blocked(&self, addr: &SocketAddr) -> bool {
-        match self.config.acl {
+        match self.acl() {
             None => false,
             Some(ref a) => a.check_client_blocked(addr),
         }
@@ -302,7 +277,7 @@ impl Context {
 
     /// Check outbound address ACL (for server)
     pub fn check_outbound_blocked(&self, addr: &Address) -> bool {
-        match self.config.acl {
+        match self.acl() {
             None => false,
             Some(ref a) => a.check_outbound_blocked(addr),
         }
@@ -310,7 +285,7 @@ impl Context {
 
     /// Check resolved outbound address ACL (for server)
     pub fn check_resolved_outbound_blocked(&self, addr: &SocketAddr) -> bool {
-        match self.config.acl {
+        match self.acl() {
             None => false,
             Some(ref a) => a.check_resolved_outbound_blocked(addr),
         }
@@ -319,7 +294,11 @@ impl Context {
     /// Add a record to the reverse lookup cache
     #[cfg(feature = "local-dns-relay")]
     pub fn add_to_reverse_lookup_cache(&self, addr: &IpAddr, forward: bool) {
-        let is_exception = self.check_ip_in_proxy_list(addr) != forward;
+        let is_exception = forward != match self.acl() {
+            // Proxy everything by default
+            None => true,
+            Some(ref a) => a.check_ip_in_proxy_list(addr)
+        };
         let mut reverse_lookup_cache = self.reverse_lookup_cache.lock();
         match reverse_lookup_cache.get_mut(addr) {
             Some(value) => {
@@ -338,37 +317,13 @@ impl Context {
         }
     }
 
-    /// Check if domain name is in proxy_list.
-    /// If so, it should be resolved from remote (for Android's DNS relay)
-    pub fn check_qname_in_proxy_list(&self, qname: &Address) -> Option<bool> {
-        match self.config.acl {
-            // Proxy everything by default
-            None => None,
-            Some(ref a) => a.check_qname_in_proxy_list(qname),
-        }
-    }
-
-    #[cfg(feature = "local-dns-relay")]
-    pub fn check_ip_in_proxy_list(&self, ip: &IpAddr) -> bool {
-        match self.config.acl {
-            // Proxy everything by default
-            None => true,
-            Some(ref a) => {
-                // do the reverse lookup in our local cache
-                let mut reverse_lookup_cache = self.reverse_lookup_cache.lock();
-                // if a qname is found
-                if let Some(forward) = reverse_lookup_cache.get(ip) {
-                    *forward
-                } else {
-                    a.check_ip_in_proxy_list(ip)
-                }
-            }
-        }
+    pub fn acl(&self) -> &Option<AccessControl> {
+        &self.config.acl
     }
 
     /// Check target address ACL (for client)
     pub async fn check_target_bypassed(&self, target: &Address) -> bool {
-        match self.config.acl {
+        match self.acl() {
             // Proxy everything by default
             None => false,
             Some(ref a) => {
